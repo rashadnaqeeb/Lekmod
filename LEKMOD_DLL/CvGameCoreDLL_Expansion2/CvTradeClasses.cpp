@@ -30,6 +30,28 @@
 #define TEMPORARY_POPUPROUTE_ID (-1) //m_aTradeConnections will never use this as an index
 #define MAX_PLOTS_TO_DISPLAY 256
 
+// CIVVACCESS: when the engine force-cancels a route (destination city
+// captured, war declared, city-state reset) it hands the origin a fresh
+// trade unit. Carry the old route unit's player-set name onto it so
+// nicknames survive (issue #13), mirroring the establish / route-complete
+// transfers in CvPlayerTrade::CreateTradeRoute and MoveUnits. The old route
+// unit (iOldUnitID) is still alive here; EmptyTradeRoute kills it afterward.
+static void CivVAccessReturnTradeUnitWithName(PlayerTypes eOwner, int iOldUnitID, int iX, int iY, UnitTypes eUnitType)
+{
+	CvPlayer& kOwner = GET_PLAYER(eOwner);
+	CvString strCarriedName = "";
+	CvUnit* pOld = kOwner.getUnit(iOldUnitID);
+	if (pOld)
+	{
+		strCarriedName = pOld->getNameNoDesc();
+	}
+	CvUnit* pNew = kOwner.initUnit(eUnitType, iX, iY, UNITAI_TRADE_UNIT);
+	if (pNew && !strCarriedName.IsEmpty())
+	{
+		pNew->setName(strCarriedName);
+	}
+}
+
 //	--------------------------------------------------------------------------------
 /// Default constructor
 #ifdef AUI_WARNING_FIXES
@@ -1159,7 +1181,7 @@ void CvGameTrade::ClearAllCityTradeRoutes (CvPlot* pPlot)
 					CvAssertMsg(eUnitType != NO_UNIT, "No trade unit found");
 					if (eUnitType != NO_UNIT)
 					{
-						GET_PLAYER(m_aTradeConnections[ui].m_eOriginOwner).initUnit(eUnitType, m_aTradeConnections[ui].m_iOriginX, m_aTradeConnections[ui].m_iOriginY, UNITAI_TRADE_UNIT);
+						CivVAccessReturnTradeUnitWithName(m_aTradeConnections[ui].m_eOriginOwner, m_aTradeConnections[ui].m_unitID, m_aTradeConnections[ui].m_iOriginX, m_aTradeConnections[ui].m_iOriginY, eUnitType);
 					}
 				}
 
@@ -1200,7 +1222,7 @@ void CvGameTrade::ClearAllCivTradeRoutes (PlayerTypes ePlayer)
 					CvAssertMsg(eUnitType != NO_UNIT, "No trade unit found");
 					if (eUnitType != NO_UNIT)
 					{
-						GET_PLAYER(m_aTradeConnections[ui].m_eOriginOwner).initUnit(eUnitType, m_aTradeConnections[ui].m_iOriginX, m_aTradeConnections[ui].m_iOriginY, UNITAI_TRADE_UNIT);
+						CivVAccessReturnTradeUnitWithName(m_aTradeConnections[ui].m_eOriginOwner, m_aTradeConnections[ui].m_unitID, m_aTradeConnections[ui].m_iOriginX, m_aTradeConnections[ui].m_iOriginY, eUnitType);
 					}
 				}
 
@@ -1231,7 +1253,7 @@ void CvGameTrade::ClearAllCityStateTradeRoutes (void)
 				CvAssertMsg(eUnitType != NO_UNIT, "No trade unit found");
 				if (eUnitType != NO_UNIT)
 				{
-					GET_PLAYER(m_aTradeConnections[ui].m_eOriginOwner).initUnit(eUnitType, m_aTradeConnections[ui].m_iOriginX, m_aTradeConnections[ui].m_iOriginY, UNITAI_TRADE_UNIT);
+					CivVAccessReturnTradeUnitWithName(m_aTradeConnections[ui].m_eOriginOwner, m_aTradeConnections[ui].m_unitID, m_aTradeConnections[ui].m_iOriginX, m_aTradeConnections[ui].m_iOriginY, eUnitType);
 				}
 			}
 
@@ -2317,13 +2339,29 @@ void CvPlayerTrade::MoveUnits (void)
 				int iOriginY = pTradeConnection->m_iOriginY;
 				DomainTypes eDomain = pTradeConnection->m_eDomain;
 
+				// CIVVACCESS: capture the route unit's player-set name before
+				// EmptyTradeRoute kills it, to carry onto the reborn unit so
+				// nicknames survive a route completing (issue #13).
+				CvString strCarriedName = "";
+				CvUnit* pOldTradeUnit = m_pPlayer->getUnit(pTradeConnection->m_unitID);
+				if (pOldTradeUnit)
+				{
+					strCarriedName = pOldTradeUnit->getNameNoDesc();
+				}
+
 				// wipe trade route
 				pTrade->EmptyTradeRoute(ui);
-				
+
 				// create new unit
 				UnitTypes eUnitType = GetTradeUnit(eDomain);
 #ifdef CVASSERT_ENABLE
 				CvUnit* pRebornUnit = m_pPlayer->initUnit(eUnitType, iOriginX, iOriginY, UNITAI_TRADE_UNIT);
+
+				// CIVVACCESS: restore the carried name onto the reborn unit.
+				if (pRebornUnit && !strCarriedName.IsEmpty())
+				{
+					pRebornUnit->setName(strCarriedName);
+				}
 
 				DEBUG_VARIABLE(pRebornUnit);
 				CvAssertMsg(pRebornUnit, "pRebornUnit is null. This is bad!!");
@@ -3989,7 +4027,7 @@ bool CvPlayerTrade::CanCreateTradeRoute(DomainTypes eDomain)
 }
 
 //	--------------------------------------------------------------------------------
-bool CvPlayerTrade::CreateTradeRoute(CvCity* pOriginCity, CvCity* pDestCity, DomainTypes eDomain, TradeConnectionType eConnectionType)
+bool CvPlayerTrade::CreateTradeRoute(CvCity* pOriginCity, CvCity* pDestCity, DomainTypes eDomain, TradeConnectionType eConnectionType, const CvString& strCarriedName)
 {
 	int plotsX[MAX_PLOTS_TO_DISPLAY], plotsY[MAX_PLOTS_TO_DISPLAY];
 
@@ -4004,6 +4042,19 @@ bool CvPlayerTrade::CreateTradeRoute(CvCity* pOriginCity, CvCity* pDestCity, Dom
 	int iRouteIndex = pTrade->GetIndexFromID(iRouteID);
 	if (iRouteIndex != -1)
 	{
+		// CIVVACCESS: carry the establishing unit's player-set name onto the
+		// trade unit the engine just spawned, so nicknames survive starting a
+		// route (issue #13). The establishing unit was already consumed; its
+		// name arrives via strCarriedName from CvUnit::makeTradeRoute.
+		if (!strCarriedName.IsEmpty())
+		{
+			CvUnit* pkTradeUnit = m_pPlayer->getUnit(pTrade->m_aTradeConnections[iRouteIndex].m_unitID);
+			if (pkTradeUnit)
+			{
+				pkTradeUnit->setName(strCarriedName);
+			}
+		}
+
 		int nPlots = pTrade->m_aTradeConnections[iRouteIndex].m_aPlotList.size();
 		if (nPlots > 0) {
 			if (nPlots > MAX_PLOTS_TO_DISPLAY)

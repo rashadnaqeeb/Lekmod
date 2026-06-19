@@ -9870,6 +9870,26 @@ bool CvPlot::setRevealed(TeamTypes eTeam, bool bNewValue, bool bTerrainOnly, Tea
 
 		m_bfRevealed.ToggleBit(eTeam);
 
+		// CIVVACCESS: Fire a "first reveal" hook so the accessibility mod can
+		// announce newly-revealed tiles to blind players. We sit inside the
+		// state-flip guard so the hook fires only on the actual transition,
+		// not on visibility flips of already-revealed tiles. Gated on
+		// bNewValue so unreveal flips (raze, etc.) don't fire, and on
+		// non-barbarian teams to mirror the natural-wonder hook below.
+		if(bNewValue && eTeam != BARBARIAN_TEAM)
+		{
+			ICvEngineScriptSystem1* pkScriptSystem = gDLL->GetScriptSystem();
+			if(pkScriptSystem)
+			{
+				CvLuaArgsHandle args;
+				args->Push(eTeam);
+				args->Push(getX());
+				args->Push(getY());
+				bool bResult = false;
+				LuaSupport::CallHook(pkScriptSystem, "CivVAccessPlotRevealed", args.get(), bResult);
+			}
+		}
+
 		bool bEligibleForAchievement = GET_PLAYER(GC.getGame().getActivePlayer()).isHuman() && !GC.getGame().isGameMultiPlayer();
 
 		if(area())

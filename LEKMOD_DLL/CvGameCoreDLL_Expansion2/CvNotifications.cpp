@@ -1,5 +1,5 @@
 /*	-------------------------------------------------------------------------------------------------------
-	© 1991-2012 Take-Two Interactive Software and its subsidiaries.  Developed by Firaxis Games.  
+	ï¿½ 1991-2012 Take-Two Interactive Software and its subsidiaries.  Developed by Firaxis Games.  
 	Sid Meier's Civilization V, Civ, Civilization, 2K Games, Firaxis Games, Take-Two Interactive Software 
 	and their respective logos are all trademarks of Take-Two interactive Software, Inc.  
 	All other marks and trademarks are the property of their respective owners.  
@@ -649,6 +649,17 @@ bool CvNotifications::GetEndTurnBlockedType(EndTurnBlockingTypes& eBlockingType,
 				break;
 
 			case NOTIFICATION_PRODUCTION:
+				// CIVVACCESS: don't block end-turn on a production notification
+				// whose city is gone or no longer ours. If you capture a city,
+				// it raises a choose-production notification, and you trade it
+				// away the same turn, the notification's city changes hands but
+				// the notification lingers on your list. Update() would dismiss
+				// it next turn, but the turn can't advance to get there, so the
+				// end-turn check deadlocks. Validate expiry inline to break it.
+				if(IsNotificationExpired(iIndex))
+				{
+					break;
+				}
 				eBlockingType = ENDTURN_BLOCKING_PRODUCTION;
 				iNotificationIndex = m_aNotifications[iIndex].m_iLookupIndex;
 				return true;

@@ -1696,6 +1696,28 @@ uint CvUnitCombat::ApplyNuclearExplosionDamage(const CvCombatMemberEntry* pkDama
 				if((eAttackerOwner == NO_PLAYER || pkUnit->getOwner() != eAttackerOwner) && !pkUnit->isBarbarian())
 					uiOpposingDamageCount++;	// Count the number of non-barbarian opposing units
 
+				// CIVVACCESS: Fire NukeUnitAffected hook BEFORE applying damage
+				// so the unit handle is still valid when Lua resolves its name.
+				// kEntry holds the engine's pre-computed post-damage values
+				// (delta, final, max), so the hook payload is complete without
+				// needing a post-application read. Skipped for meltdowns
+				// (pkAttacker == NULL); those have a different speech path.
+				if(pkAttacker != NULL)
+				{
+					ICvEngineScriptSystem1* pkScriptSystem = gDLL->GetScriptSystem();
+					if(pkScriptSystem)
+					{
+						CvLuaArgsHandle args;
+						args->Push(kEntry.GetPlayer());
+						args->Push(kEntry.GetUnitID());
+						args->Push(kEntry.GetDamage());
+						args->Push(kEntry.GetFinalDamage());
+						args->Push(kEntry.GetMaxHitPoints());
+						bool bResult;
+						LuaSupport::CallHook(pkScriptSystem, "CivVAccessNukeUnitAffected", args.get(), bResult);
+					}
+				}
+
 				if(pkUnit->IsCombatUnit() || pkUnit->IsCanAttackRanged())
 				{
 					pkUnit->changeDamage(kEntry.GetDamage(), eAttackerOwner);
@@ -1796,6 +1818,30 @@ uint CvUnitCombat::ApplyNuclearExplosionDamage(const CvCombatMemberEntry* pkDama
 
 				if(kEntry.GetFinalDamage() >= pkCity->GetMaxHitPoints() && !pkCity->IsOriginalCapital())
 				{
+					// CIVVACCESS: Fire NukeCityAffected hook BEFORE pkCity->kill()
+					// so the Lua handler can resolve the city handle and snapshot
+					// its name. popDelta == 0 for destroyed cities -- the entire
+					// population is implicit from "destroyed" and the speech path
+					// elides a redundant pop clause. Skipped for meltdowns
+					// (pkAttacker == NULL).
+					if(pkAttacker != NULL)
+					{
+						ICvEngineScriptSystem1* pkScriptSystem = gDLL->GetScriptSystem();
+						if(pkScriptSystem)
+						{
+							CvLuaArgsHandle args;
+							args->Push(kEntry.GetPlayer());
+							args->Push(kEntry.GetCityID());
+							args->Push(kEntry.GetDamage());
+							args->Push(kEntry.GetFinalDamage());
+							args->Push(kEntry.GetMaxHitPoints());
+							args->Push(0);
+							args->Push(1);
+							bool bResult;
+							LuaSupport::CallHook(pkScriptSystem, "CivVAccessNukeCityAffected", args.get(), bResult);
+						}
+					}
+
 					auto_ptr<ICvCity1> pkDllCity(new CvDllCity(pkCity));
 					gDLL->GameplayCitySetDamage(pkDllCity.get(), 0, pkCity->getDamage()); // to stop the fires
 					gDLL->GameplayCityDestroyed(pkDllCity.get(), NO_PLAYER);
@@ -1834,7 +1880,8 @@ uint CvUnitCombat::ApplyNuclearExplosionDamage(const CvCombatMemberEntry* pkDama
 					iNukedPopulation *= std::max(0, (pkCity->getNukeModifier() + 100));
 					iNukedPopulation /= 100;
 
-					pkCity->changePopulation(-(std::min((pkCity->getPopulation() - 1), iNukedPopulation)));
+					int iAppliedPopDelta = std::min((pkCity->getPopulation() - 1), iNukedPopulation);
+					pkCity->changePopulation(-iAppliedPopDelta);
 
 					// Add damage to the city
 #ifdef ENHANCED_GRAPHS
@@ -1842,6 +1889,28 @@ uint CvUnitCombat::ApplyNuclearExplosionDamage(const CvCombatMemberEntry* pkDama
 					GET_PLAYER(pkAttacker->getOwner()).ChangeCitiesDamageDealt(kEntry.GetFinalDamage() - pkCity->getDamage());
 #endif
 					pkCity->setDamage(kEntry.GetFinalDamage());
+
+					// CIVVACCESS: Fire NukeCityAffected hook AFTER the engine
+					// has applied damage / pop loss. popDelta is the actual
+					// population delta engine applied (capped at prePop-1).
+					// Skipped for meltdowns (pkAttacker == NULL).
+					if(pkAttacker != NULL)
+					{
+						ICvEngineScriptSystem1* pkScriptSystem = gDLL->GetScriptSystem();
+						if(pkScriptSystem)
+						{
+							CvLuaArgsHandle args;
+							args->Push(kEntry.GetPlayer());
+							args->Push(kEntry.GetCityID());
+							args->Push(kEntry.GetDamage());
+							args->Push(kEntry.GetFinalDamage());
+							args->Push(kEntry.GetMaxHitPoints());
+							args->Push(iAppliedPopDelta);
+							args->Push(0);
+							bool bResult;
+							LuaSupport::CallHook(pkScriptSystem, "CivVAccessNukeCityAffected", args.get(), bResult);
+						}
+					}
 
 #ifdef AUI_WARNING_FIXES
 					if (pkAttacker)
@@ -2017,6 +2086,40 @@ void CvUnitCombat::ResolveNuclearCombat(const CvCombatInfo& kCombatInfo, uint ui
 
 	GC.getGame().changeNukesExploded(1);
 
+	// CIVVACCESS: Fire NukeStart hook so the mod's accumulator knows a
+	// nuclear strike is about to apply damage. Per-entity NukeUnitAffected
+	// / NukeCityAffected hooks fire from within ApplyNuclearExplosionDamage;
+	// NukeEnd fires after the damage application returns. The mod buffers
+	// affected entities between Start and End and emits one composed speech
+	// line at End. targetCityPlayer / targetCityId surface the target plot's
+	// city if any so the speech can name the strike target separately from
+	// the casualty list.
+	if(pkAttacker && pkTargetPlot)
+	{
+		ICvEngineScriptSystem1* pkScriptSystem = gDLL->GetScriptSystem();
+		if(pkScriptSystem)
+		{
+			int iTargetCityPlayer = -1;
+			int iTargetCityId = -1;
+			CvCity* pkTargetCity = pkTargetPlot->getPlotCity();
+			if(pkTargetCity != NULL)
+			{
+				iTargetCityPlayer = pkTargetCity->getOwner();
+				iTargetCityId = pkTargetCity->GetID();
+			}
+			CvLuaArgsHandle args;
+			args->Push(pkAttacker->getOwner());
+			args->Push(pkAttacker->GetID());
+			args->Push(pkTargetPlot->getX());
+			args->Push(pkTargetPlot->getY());
+			args->Push(kCombatInfo.getAttackNuclearLevel());
+			args->Push(iTargetCityPlayer);
+			args->Push(iTargetCityId);
+			bool bResult;
+			LuaSupport::CallHook(pkScriptSystem, "CivVAccessNukeStart", args.get(), bResult);
+		}
+	}
+
 	if(pkAttacker)
 	{
 		// Make sure we are disconnected from any unit transporting the attacker (i.e. its a missile)
@@ -2078,6 +2181,22 @@ void CvUnitCombat::ResolveNuclearCombat(const CvCombatInfo& kCombatInfo, uint ui
 		// Report that combat is over in case we want to queue another attack
 		GET_PLAYER(pkAttacker->getOwner()).GetTacticalAI()->CombatResolved(pkAttacker, true);
 	}
+
+	// CIVVACCESS: Fire NukeEnd hook so the mod can flush its accumulator
+	// and speak the composed strike result. Fires unconditionally for
+	// NukeStart -- the mod's onNukeEnd handles the no-buffer / no-affected
+	// case (announces "no targets hit").
+	if(pkAttacker)
+	{
+		ICvEngineScriptSystem1* pkScriptSystem = gDLL->GetScriptSystem();
+		if(pkScriptSystem)
+		{
+			CvLuaArgsHandle args;
+			args->Push(pkAttacker->getOwner());
+			bool bResult;
+			LuaSupport::CallHook(pkScriptSystem, "CivVAccessNukeEnd", args.get(), bResult);
+		}
+	}
 }
 
 //	---------------------------------------------------------------------------
@@ -2109,6 +2228,31 @@ void CvUnitCombat::ResolveCombat(const CvCombatInfo& kInfo, uint uiParentEventID
 		auto_ptr<ICvUnit1> pDllUnit(new CvDllUnit(pDefenderSupport));
 		gDLL->GameplayUnitVisibility(pDllUnit.get(), !pDefenderSupport->isInvisible(eActiveTeam, false));
 	}
+
+	// CIVVACCESS: snapshot pre-combat damage so the post-resolve hook can
+	// compute per-combat deltas without the accessibility mod having to poll
+	// damage settlement Lua-side. pAttackerCityForHook covers the city-as-
+	// attacker ranged-strike path (ResolveRangedCityVsUnitCombat); cities
+	// don't take damage from their own ranged strikes so iAtkCityPreDamage
+	// is captured but the post-combat delta will always be 0 (mod-side
+	// "unhurt" branch handles the readout naturally).
+	//
+	// The defender city snapshots (owner, ID, max HP) are also needed to
+	// survive the city-capture path: ResolveCityMeleeCombat triggers
+	// pkAttacker->UnitMove which calls acquireCity, and acquireCity
+	// "will delete the pointer" (CvUnit.cpp:13287). After capture
+	// pDefenderCityForHook is dangling; reading its fields in the post-
+	// resolve payload is use-after-free. The capture branch below uses
+	// these snapshots instead.
+	CvCity* pDefenderCityForHook = kInfo.getCity(BATTLE_UNIT_DEFENDER);
+	CvCity* pAttackerCityForHook = kInfo.getCity(BATTLE_UNIT_ATTACKER);
+	const int iAtkPreDamage = pAttacker ? pAttacker->getDamage() : 0;
+	const int iAtkCityPreDamage = pAttackerCityForHook ? pAttackerCityForHook->getDamage() : 0;
+	const int iDefUnitPreDamage = pDefender ? pDefender->getDamage() : 0;
+	const int iDefCityPreDamage = pDefenderCityForHook ? pDefenderCityForHook->getDamage() : 0;
+	const PlayerTypes eDefCityPreOwner = pDefenderCityForHook ? pDefenderCityForHook->getOwner() : NO_PLAYER;
+	const int iDefCityPreID = pDefenderCityForHook ? pDefenderCityForHook->GetID() : -1;
+	const int iDefCityMaxHP = pDefenderCityForHook ? pDefenderCityForHook->GetMaxHitPoints() : 0;
 	// Nuclear Mission
 	if(kInfo.getAttackIsNuclear())
 	{
@@ -2169,6 +2313,289 @@ void CvUnitCombat::ResolveCombat(const CvCombatInfo& kInfo, uint uiParentEventID
 			{
 				pPlot->AddArchaeologicalRecord(CvTypes::getARTIFACT_BATTLE_MELEE(), kInfo.getUnit(BATTLE_UNIT_ATTACKER)->getOwner(), kInfo.getUnit(BATTLE_UNIT_DEFENDER)->getOwner());
 			}
+		}
+	}
+
+	// CIVVACCESS: detect a city defender that was captured by this combat.
+	// ResolveCityMeleeCombat's conquest branch invokes acquireCity inside
+	// pkAttacker->UnitMove, which deletes the original CvCity. After the
+	// dispatcher returns to here the post-resolve plot holds a NEW city
+	// owned by the conqueror with the same name on the same tile; the
+	// owner change is the cleanest signal that capture happened.
+	// Barbarian ransom (ResolveCityMeleeCombat:1006) leaves the original
+	// city with its old owner at maxHP-1, so the verify-still-alive path
+	// flips this back to false there and the existing dereference branch
+	// remains safe.
+	//
+	// Default is true (use safe pre-resolve snapshots) for any city
+	// defender; we only flip to false after affirmatively verifying the
+	// original city is still on its plot with its original owner. If the
+	// plot is NULL or the post-resolve city is NULL or the owner changed,
+	// we cannot safely dereference pDefenderCityForHook -- so we leave
+	// the captured branch in charge.
+	bool bDefenderCityCaptured = false;
+	if(pDefenderCityForHook != NULL && pDefender == NULL)
+	{
+		bDefenderCityCaptured = true;
+		CvPlot* pCapturePlot = kInfo.getPlot();
+		if(pCapturePlot != NULL)
+		{
+			CvCity* pPostResolveCity = pCapturePlot->getPlotCity();
+			if(pPostResolveCity != NULL && pPostResolveCity->getOwner() == eDefCityPreOwner)
+			{
+				bDefenderCityCaptured = false;
+			}
+		}
+	}
+
+	// CIVVACCESS: Fire CombatResolved hook for the accessibility mod. The
+	// existing Events.EndCombatSim path only fires when the gDLL combat
+	// animation completes; CvPreGame::quickCombat() bypasses that, and
+	// city defenders never get an EndCombatSim regardless of mode (city
+	// HP is announced via SerialEventCitySetDamage). Firing from here --
+	// the post-resolve point inside the dispatcher every combat funnels
+	// through -- gives the mod one synchronous signal that covers
+	// Quick + standard, units + cities on both sides, melee + ranged +
+	// air sweep. Nuclear is excluded (different announcement path). Hook
+	// fires unconditionally for the cases it covers; mod-side dedupe
+	// (clearing any combat-pending snapshot) ensures only one spoken
+	// result per combat even if both this hook and EndCombatSim fire in
+	// sequence.
+	if((pAttacker != NULL || pAttackerCityForHook != NULL)
+	    && (pDefender != NULL || pDefenderCityForHook != NULL)
+	    && !kInfo.getAttackIsNuclear())
+	{
+		ICvEngineScriptSystem1* pkScriptSystem = gDLL->GetScriptSystem();
+		if(pkScriptSystem)
+		{
+			// 15-arg payload, decoded by the Lua handler at
+			// UnitControl.onCombatResolved:
+			//   1: attackerPlayerId
+			//   2: attackerUnitId              (-1 sentinel when attacker is a city)
+			//   3: attackerDamageThisCombat   (post - pre, >= 0; includes intercept hits folded in by ResolveAirUnitVsCombat; always 0 for city attackers since cities take no damage from their own ranged strikes)
+			//   4: attackerFinalDamage         (cumulative; kill at >= maxHP)
+			//   5: attackerMaxHP
+			//   6: defenderPlayerId
+			//   7: defenderUnitId              (-1 sentinel when defender is a city)
+			//   8: defenderCityId              (-1 sentinel when defender is a unit)
+			//   9..11: defender damage / final damage / max HP, same shape as attacker
+			//   12: interceptorPlayerId        (-1 sentinel when no intercept landed)
+			//   13: interceptorUnitId          (-1 sentinel when no intercept landed)
+			//   14: interceptorDamage          (0 when no intercept landed)
+			//   15: combatKind                 (0 = normal melee/ranged/air-strike,
+			//                                   1 = air sweep into ground AA (one-way),
+			//                                   2 = air sweep into another fighter (dogfight))
+			//   16: plotVisibleToActiveTeam   (1 if target plot is active-
+			//                                   visible; 0 otherwise. Computed
+			//                                   from pPlot->isActiveVisible()
+			//                                   rather than kInfo.getVisualize
+			//                                   Combat() because the latter is
+			//                                   only set when CvPreGame::quick
+			//                                   Combat() is off -- the
+			//                                   visibility reflects what the
+			//                                   active player perceives on the
+			//                                   map regardless of whether the
+			//                                   engine plays an animation.)
+			//   17: attackerKnownToActiveTeam (0 when attacker is invisible to
+			//                                   the active team -- e.g. an AI
+			//                                   submarine ambushing an AI ship.
+			//                                   Lua substitutes "unknown" for
+			//                                   the attacker name when this
+			//                                   is 0 and the active player is
+			//                                   not involved.)
+			//   18: defenderKnownToActiveTeam (0 when defender is a unit
+			//                                   invisible to the active team.
+			//                                   Always 1 for city defenders.
+			//                                   Same parity-driven masking
+			//                                   path as attackerKnown.)
+			//   19: attackerCityId             (-1 sentinel when attacker is a
+			//                                   unit. Cities can range-strike
+			//                                   units (ResolveRangedCityVs
+			//                                   UnitCombat); the city stays
+			//                                   undamaged so attacker damage
+			//                                   fields read as 0/preDmg/maxHP.
+			//                                   Lua dispatches on
+			//                                   attackerCityId != -1 to pick
+			//                                   the city-name path for the
+			//                                   attacker side.)
+			//   20: defenderCityCaptured       (1 when the defender was a
+			//                                   city captured by this combat
+			//                                   -- the post-resolve city on
+			//                                   the plot has a different
+			//                                   owner than the pre-resolve
+			//                                   snapshot. acquireCity freed
+			//                                   the original CvCity, so the
+			//                                   defender payload (args 6-11)
+			//                                   uses pre-resolve snapshots
+			//                                   instead of the dangling
+			//                                   pointer. Lua suppresses its
+			//                                   "killed" line on this flag
+			//                                   so SerialEventCityCaptured
+			//                                   owns the capture announcement
+			//                                   without doubling it. 0 for
+			//                                   non-city defenders, surviving
+			//                                   cities, and barbarian ransom
+			//                                   (which keeps the original
+			//                                   owner.))
+			//   21: plotX                      (combat plot x coordinate; -1
+			//                                   if pHookPlot is null. Lua
+			//                                   uses (plotX, plotY) to look
+			//                                   up the post-capture city via
+			//                                   Map.GetPlot:GetPlotCity since
+			//                                   GetCityByID against the pre-
+			//                                   capture (owner, ID) fails
+			//                                   after acquireCity. Cities
+			//                                   retain their name on
+			//                                   capture so the new city on
+			//                                   the same plot reads back the
+			//                                   same name.)
+			//   22: plotY                      (combat plot y coordinate;
+			//                                   paired with plotX above.)
+			// Lua dispatches on (defenderUnitId != -1) to pick unit vs city naming.
+			// Adding fields means updating both branches AND the Lua handler;
+			// the unit branch uses (unit, -1) and the city branch (-1, city) so
+			// arg positions 6 and 9..11 stay aligned across both paths.
+			//
+			// Interceptor fields are populated only when an interceptor was
+			// assigned AND it actually dealt damage. Intercepts where the
+			// attacker evaded or the intercept roll failed (pInterceptor set
+			// but iInterceptionDamage == 0) push the sentinels -- this matches
+			// base game's UI, which only surfaces interceptor messages when
+			// iInterceptionDamage > 0 (CvUnitCombat.cpp's
+			// TXT_KEY_MISC_ENEMY_AIR_UNIT_INTERCEPTED / DESTROYED routing).
+			//
+			// combatKind separates air sweep (one-sided ground-AA exchange
+			// or two-sided fighter dogfight) from normal combat so the mod
+			// can prepend a "interception" / "dogfight" marker. Sweep is a
+			// distinct player intent ("flush enemy interceptors"); the
+			// regular attacker / defender framing alone doesn't tell the
+			// user the combat they triggered was a sweep.
+			//
+			// plotVisibleToActiveTeam + attackerKnownToActiveTeam +
+			// defenderKnownToActiveTeam together let Lua match sighted
+			// parity for AI-vs-AI combat. Plot-only visibility decides
+			// whether the active player perceives the engagement at all
+			// (off-map stays silent); the per-side known flags decide
+			// whether to name each combatant or substitute "unknown".
+			// An invisible AI sub ambushing a visible AI ship on a
+			// visible plot reads as "attacker unknown -3 hp, defender
+			// Babylonian Battleship -25 hp" -- matching what a sighted
+			// player perceives (an unseen hit landing on a visible
+			// ship). For city defenders pDefender is NULL and the
+			// engine's CvUnit::isInvisible doesn't apply; defender is
+			// always considered known in that branch since cities are
+			// visible whenever their plot is.
+			//
+			// Active-player-involved combat ignores the known flags --
+			// the engine reveals attackers via the act of attack itself
+			// (base game's defender-side messages name the attacker),
+			// so we always speak full names when the active player is
+			// a participant.
+			CvUnit* pInterceptor = kInfo.getUnit(BATTLE_UNIT_INTERCEPTOR);
+			int iInterceptDamage = pInterceptor ? kInfo.getDamageInflicted(BATTLE_UNIT_INTERCEPTOR) : 0;
+			int iCombatKind = 0;
+			if(kInfo.getAttackIsAirSweep() && pDefender != NULL)
+			{
+				iCombatKind = (pDefender->getDomainType() == DOMAIN_AIR) ? 2 : 1;
+			}
+			CvLuaArgsHandle args;
+			if(pAttacker != NULL)
+			{
+				args->Push(pAttacker->getOwner());
+				args->Push(pAttacker->GetID());
+				args->Push(pAttacker->getDamage() - iAtkPreDamage);
+				args->Push(pAttacker->getDamage());
+				args->Push(pAttacker->GetMaxHitPoints());
+			}
+			else
+			{
+				args->Push(pAttackerCityForHook->getOwner());
+				args->Push(-1);
+				args->Push(pAttackerCityForHook->getDamage() - iAtkCityPreDamage);
+				args->Push(pAttackerCityForHook->getDamage());
+				args->Push(pAttackerCityForHook->GetMaxHitPoints());
+			}
+			if(pDefender != NULL)
+			{
+				args->Push(pDefender->getOwner());
+				args->Push(pDefender->GetID());
+				args->Push(-1);
+				args->Push(pDefender->getDamage() - iDefUnitPreDamage);
+				args->Push(pDefender->getDamage());
+				args->Push(pDefender->GetMaxHitPoints());
+			}
+			else if(bDefenderCityCaptured)
+			{
+				// City was captured this combat -- pDefenderCityForHook is
+				// freed (acquireCity deleted it inside UnitMove). Use the
+				// pre-resolve snapshots and derive the per-combat damage
+				// from kInfo.getDamageInflicted, capped at remaining HP so
+				// the readout matches the engine-applied damage rather
+				// than the rolled value. Final damage = max HP signals the
+				// city went down; the Lua handler reads the captured flag
+				// (arg 20) to suppress its "killed" line so the
+				// SerialEventCityCaptured listener owns the capture
+				// announcement.
+				const int iDmgInflicted = kInfo.getDamageInflicted(BATTLE_UNIT_DEFENDER);
+				int iCappedDmg = iDmgInflicted;
+				const int iRemainingHP = iDefCityMaxHP - iDefCityPreDamage;
+				if(iCappedDmg > iRemainingHP)
+					iCappedDmg = iRemainingHP;
+				args->Push(eDefCityPreOwner);
+				args->Push(-1);
+				args->Push(iDefCityPreID);
+				args->Push(iCappedDmg);
+				args->Push(iDefCityMaxHP);
+				args->Push(iDefCityMaxHP);
+			}
+			else
+			{
+				args->Push(pDefenderCityForHook->getOwner());
+				args->Push(-1);
+				args->Push(pDefenderCityForHook->GetID());
+				args->Push(pDefenderCityForHook->getDamage() - iDefCityPreDamage);
+				args->Push(pDefenderCityForHook->getDamage());
+				args->Push(pDefenderCityForHook->GetMaxHitPoints());
+			}
+			if(pInterceptor != NULL && iInterceptDamage > 0)
+			{
+				args->Push(pInterceptor->getOwner());
+				args->Push(pInterceptor->GetID());
+				args->Push(iInterceptDamage);
+			}
+			else
+			{
+				args->Push(-1);
+				args->Push(-1);
+				args->Push(0);
+			}
+			args->Push(iCombatKind);
+			CvPlot* pHookPlot = kInfo.getPlot();
+			bool bPlotVisible = pHookPlot != NULL && pHookPlot->isActiveVisible(false);
+			// Cities are always known if their plot is visible (no per-city
+			// invisibility); the unit branch checks isInvisible against the
+			// active team.
+			bool bAttackerKnown = (pAttacker == NULL) || !pAttacker->isInvisible(eActiveTeam, false);
+			bool bDefenderKnown = (pDefender == NULL) || !pDefender->isInvisible(eActiveTeam, false);
+			args->Push(bPlotVisible ? 1 : 0);
+			args->Push(bAttackerKnown ? 1 : 0);
+			args->Push(bDefenderKnown ? 1 : 0);
+			args->Push(pAttackerCityForHook ? pAttackerCityForHook->GetID() : -1);
+			// Args 20-22: city-defender capture metadata. defenderCaptured
+			// flags the captured-this-combat case so the Lua handler can
+			// suppress its "killed" line (SerialEventCityCaptured speaks
+			// the capture announcement). plotX/plotY let Lua resolve the
+			// post-capture city name via Map.GetPlot:GetPlotCity since the
+			// pre-capture CvCity ID lookup fails (the original object was
+			// freed by acquireCity); cities retain their name on capture
+			// so the new city on the same plot reads the same name back.
+			// All three are 0/0/0 sentinels for non-city-defender combats
+			// and (-1, -1) plot fallback should pHookPlot ever be null.
+			args->Push(bDefenderCityCaptured ? 1 : 0);
+			args->Push(pHookPlot ? pHookPlot->getX() : -1);
+			args->Push(pHookPlot ? pHookPlot->getY() : -1);
+			bool bResult;
+			LuaSupport::CallHook(pkScriptSystem, "CivVAccessCombatResolved", args.get(), bResult);
 		}
 	}
 
@@ -2706,6 +3133,22 @@ CvUnitCombat::ATTACK_RESULT CvUnitCombat::AttackAirSweep(CvUnit& kAttacker, CvPl
 			Localization::String localizedText = Localization::Lookup("TXT_KEY_AIR_PATROL_FOUND_NOTHING");
 			localizedText << kAttacker.getUnitInfo().GetTextKey();
 			GC.GetEngineUserInterface()->AddMessage(0, kAttacker.getOwner(), false, GC.getEVENT_MESSAGE_TIME(), localizedText.toUTF8());
+		}
+
+		// CIVVACCESS: Fire AirSweepNoTarget hook for the accessibility mod.
+		// The engine's own AddMessage above lands in the visual notification
+		// log which the mod has no Lua subscription for; without this hook
+		// the screen-reader path stays silent on a sweep that found nothing.
+		// 2-arg payload: attackerPlayerId, attackerUnitId. Lua filters to
+		// the active player same as CombatResolved.
+		ICvEngineScriptSystem1* pkScriptSystem = gDLL->GetScriptSystem();
+		if(pkScriptSystem)
+		{
+			CvLuaArgsHandle args;
+			args->Push(kAttacker.getOwner());
+			args->Push(kAttacker.GetID());
+			bool bResult;
+			LuaSupport::CallHook(pkScriptSystem, "CivVAccessAirSweepNoTarget", args.get(), bResult);
 		}
 
 		// Spend a move for this attack

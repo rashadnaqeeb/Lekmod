@@ -7245,6 +7245,11 @@ bool CvUnit::makeTradeRoute(int iX, int iY, TradeConnectionType eConnectionType)
 		return false;
 	}
 
+	// CIVVACCESS: kill() consumes this unit and the engine spawns a fresh
+	// trade unit to run the route, so capture any player-set name first and
+	// carry it onto the new unit (issue #13).
+	CvString strCarriedName = getNameNoDesc();
+
 	kill(true);
 
 	CvCity* pFromCity = NULL;
@@ -7261,7 +7266,7 @@ bool CvUnit::makeTradeRoute(int iX, int iY, TradeConnectionType eConnectionType)
 		pToCity = pToPlot->getPlotCity();
 	}
 
-	bool bResult = GET_PLAYER(getOwner()).GetTrade()->CreateTradeRoute(pFromCity, pToCity, getDomainType(), eConnectionType);
+	bool bResult = GET_PLAYER(getOwner()).GetTrade()->CreateTradeRoute(pFromCity, pToCity, getDomainType(), eConnectionType, strCarriedName);
 	return bResult;
 }
 
@@ -17978,6 +17983,48 @@ void CvUnit::setXY(int iX, int iY, bool bGroup, bool bUpdate, bool bShow, bool b
 								}
 
 							}
+
+							// CIVVACCESS: barbarian-camp-cleared hook for the
+							// accessibility mod's MP fallback. Vanilla emits
+							// BUTTONPOPUP_BARBARIAN_CAMP_REWARD only in SP (see
+							// the !isNetworkMultiPlayer guard above); this hook
+							// fires unconditionally for the active player so
+							// the Lua side has a signal in MP. Consumed by
+							// CivVAccess_MultiplayerRewards.lua, which gates on
+							// Game:IsNetworkMultiPlayer() so SP keeps riding
+							// the popup path.
+							ICvEngineScriptSystem1* pkScriptSystem = gDLL->GetScriptSystem();
+							if(pkScriptSystem)
+							{
+								CvLuaArgsHandle args;
+								args->Push(getOwner());
+								args->Push(pNewPlot->getX());
+								args->Push(pNewPlot->getY());
+								args->Push(iNumGold);
+								bool bResult = false;
+								LuaSupport::CallHook(pkScriptSystem, "CivVAccessBarbarianCampCleared", args.get(), bResult);
+							}
+						}
+						else
+						{
+							// CIVVACCESS: foreign-cleared sibling. The block
+							// above only fires for the active player. When
+							// some other civ clears a camp, a sighted player
+							// would notice if the plot is in their line of
+							// sight; an unsighted player would not. Fire an
+							// unconditional hook so the Lua side can decide
+							// (visibility filter, teammate filter, etc.).
+							// Consumed by CivVAccess_ForeignClearWatch.lua.
+							ICvEngineScriptSystem1* pkScriptSystem = gDLL->GetScriptSystem();
+							if(pkScriptSystem)
+							{
+								CvLuaArgsHandle args;
+								args->Push(getOwner());
+								args->Push(pNewPlot->getX());
+								args->Push(pNewPlot->getY());
+								bool bResult = false;
+								LuaSupport::CallHook(pkScriptSystem, "CivVAccessForeignBarbCampCleared", args.get(), bResult);
+							}
 						}
 					}
 				}
@@ -18111,6 +18158,32 @@ void CvUnit::setXY(int iX, int iY, bool bGroup, bool bUpdate, bool bShow, bool b
 		DLLUI->SetSpecificCityInfoDirty(pkDllCity.get(), CITY_UPDATE_TYPE_GARRISON);
 	}
 	
+	// CIVVACCESS: per-step unit-move hook. setXY is called once per hex as a
+	// unit traverses its path (and once per teleport), so this fires one event
+	// per step with the from / to coords; the Lua side (CivVAccess_UnitMoveLog
+	// .lua) buffers a unit's steps within a tick and run-length-encodes the
+	// direction sequence ("moves 2 E, 1 NE"). Fires for every owner -- the Lua
+	// side filters to visible foreign / other-human units plus the active
+	// player's own queued-move continuations. Guarded to an actual position
+	// change so initial placement and no-op setXY calls emit no spurious step;
+	// teleports (distance > 1) are told apart on the Lua side via PlotDistance.
+	if(pOldPlot != NULL && pNewPlot != NULL && pOldPlot != pNewPlot)
+	{
+		ICvEngineScriptSystem1* pkScriptSystem = gDLL->GetScriptSystem();
+		if(pkScriptSystem)
+		{
+			CvLuaArgsHandle args;
+			args->Push(getOwner());
+			args->Push(GetID());
+			args->Push(pOldPlot->getX());
+			args->Push(pOldPlot->getY());
+			args->Push(pNewPlot->getX());
+			args->Push(pNewPlot->getY());
+			bool bResult = false;
+			LuaSupport::CallHook(pkScriptSystem, "CivVAccessUnitMoved", args.get(), bResult);
+		}
+	}
+
 	//Dr. Livingstone I presume?
 	if (isHuman() && !isDelayedDeath())
 	{

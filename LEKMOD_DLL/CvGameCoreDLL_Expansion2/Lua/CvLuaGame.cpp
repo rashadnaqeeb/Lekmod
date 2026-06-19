@@ -26,6 +26,11 @@
 #include "../CvInternalGameCoreUtils.h"
 #include "../CvGameTextMgr.h"
 #include "../CvReplayMessage.h"
+// CIVVACCESS: Game.GetCycleUnits / Game.GetBuildRoutePath /
+// Game.GetClosestSearchedPlot bindings.
+#include "../CvUnitCycler.h"
+#include "../CvAStar.h"
+#include "../CvGameCoreUtils.h"
 
 #define Method(func) RegisterMethod(L, l##func, #func);
 
@@ -52,6 +57,9 @@ void CvLuaGame::RegisterMembers(lua_State* L)
 	Method(CycleCities);
 	Method(CycleUnits);
 	Method(CyclePlotUnits);
+	Method(GetCycleUnits);
+	Method(GetBuildRoutePath);
+	Method(GetClosestSearchedPlot);
 
 	Method(SelectionListMove);
 	Method(SelectionListGameNetMessage);
@@ -480,6 +488,195 @@ int CvLuaGame::lCyclePlotUnits(lua_State* L)
 	const bool bResult = GetInstance()->cyclePlotUnits(pkPlot, bForward, bAuto, iCount);
 	lua_pushboolean(L, bResult);
 	return 1;
+}
+//------------------------------------------------------------------------------
+// CIVVACCESS: Returns the active player's CvUnitCycler order as a 1-indexed
+// Lua array of unit IDs. Same data structure the engine's Game.CycleUnits
+// walks; exposing it Lua-side replaces the nearest-neighbor + 2-opt
+// reimplementation in CivVAccess_UnitControl.lua and guarantees parity
+// with the engine's own cycle order.
+int CvLuaGame::lGetCycleUnits(lua_State* L)
+{
+	const PlayerTypes ePlayer = GetInstance()->getActivePlayer();
+	lua_createtable(L, 0, 0);
+	if(ePlayer < 0 || ePlayer >= MAX_PLAYERS)
+	{
+		return 1;
+	}
+	CvUnitCycler& kCycler = GET_PLAYER(ePlayer).GetUnitCycler();
+	const CvUnitCycler::Node* pNode = kCycler.HeadNode();
+	int i = 0;
+	while(pNode != NULL)
+	{
+		lua_pushinteger(L, pNode->m_data);
+		lua_rawseti(L, -2, ++i);
+		pNode = kCycler.NextNode(pNode);
+	}
+	return 1;
+}
+//------------------------------------------------------------------------------
+// CIVVACCESS: Wraps GC.GetBuildRouteFinder() so route-to mission preview
+// can compute the same path the engine will follow at execution time.
+// Args: (iStartX, iStartY, iEndX, iEndY, iPlayer, [iRoute = NO_ROUTE]).
+// Returns a 1-indexed Lua array ordered start-to-destination, each entry
+// { x, y }. Empty array if no path exists. Caller sums build turns via
+// Plot:GetBuildTurnsLeft. Flag encoding (player ID in low byte, route+1
+// in second byte) matches CvBuilderTaskingAI.cpp:309-312.
+int CvLuaGame::lGetBuildRoutePath(lua_State* L)
+{
+	const int iStartX = luaL_checkint(L, 1);
+	const int iStartY = luaL_checkint(L, 2);
+	const int iEndX   = luaL_checkint(L, 3);
+	const int iEndY   = luaL_checkint(L, 4);
+	const int iPlayer = luaL_checkint(L, 5);
+	const int iRoute  = luaL_optint(L, 6, NO_ROUTE);
+
+	int iFlags = iPlayer & 0xFF;
+	iFlags |= ((iRoute + 1) & 0xFF) << 8;
+
+	CvAStar& kFinder = GC.GetBuildRouteFinder();
+	const bool bFound = kFinder.GeneratePath(iStartX, iStartY, iEndX, iEndY, iFlags);
+
+	// GetLastNode is the destination; walk parents back to start, buffer,
+	// then push reversed for start-first ordering. Cap at 2048 nodes --
+	// the engine's MAX_PATHS-style ceiling is implicit; on a Huge map the
+	// longest possible route is well under 1000 hexes.
+	int iaX[2048];
+	int iaY[2048];
+	int iCount = 0;
+	if(bFound)
+	{
+		CvAStarNode* pNode = kFinder.GetLastNode();
+		while(pNode != NULL && iCount < 2048)
+		{
+			iaX[iCount] = pNode->m_iX;
+			iaY[iCount] = pNode->m_iY;
+			++iCount;
+			pNode = pNode->m_pParent;
+		}
+	}
+
+	lua_createtable(L, iCount, 0);
+	for(int i = 0; i < iCount; ++i)
+	{
+		const int iSrc = iCount - 1 - i;
+		lua_createtable(L, 0, 2);
+		lua_pushinteger(L, iaX[iSrc]); lua_setfield(L, -2, "x");
+		lua_pushinteger(L, iaY[iSrc]); lua_setfield(L, -2, "y");
+		lua_rawseti(L, -2, i + 1);
+	}
+	return 1;
+}
+//------------------------------------------------------------------------------
+// CIVVACCESS: After a failed Unit:GeneratePath, the underlying CvAStar's
+// closed list still chains every node the search reached before exhaustion.
+// This binding walks that closed list and returns the (x, y) of the node
+// at minimum hex distance from the supplied target. That tile is the "got
+// as far as X" answer for unreachable destinations -- the strict-reachable
+// frontier in the direction of the original target.
+//
+// Usage: caller MUST invoke this immediately after the failed GeneratePath,
+// before any subsequent search runs (the next GeneratePath with bReuse=false
+// wipes the closed list at the start of its run, line 236-244 of CvAStar.cpp).
+//
+// Args: (iTargetX, iTargetY).
+// Returns: (x, y, distance) on success, or no return values when the closed
+// list is empty (e.g., search never started, or the start position itself
+// was invalid).
+int CvLuaGame::lGetClosestSearchedPlot(lua_State* L)
+{
+	const int iTargetX = luaL_checkint(L, 1);
+	const int iTargetY = luaL_checkint(L, 2);
+
+	CvAStar& kFinder = GC.getPathFinder();
+	CvUnit* pUnit = (CvUnit*)kFinder.GetData();
+	CvMap& kMap = GC.getMap();
+
+	// Per-candidate noise filter. PathValid's first-step trivial pass at
+	// CvAStar.cpp:1445 ("if (pUnitPlot == pFromPlot) return TRUE") admits
+	// every child of the unit's start node without running the canMoveThrough
+	// territory / terrain gate, so closed-border tiles, mountains for non-
+	// mountain units, and deep ocean without astronomy all end up in
+	// m_pClosed when adjacent to the actor. The earlier hard rejections in
+	// PathValid (land->water without embark; non-combat unit + foreign unit
+	// on plot) still fire, but anything the engine checks via canMoveInto
+	// on the destination plot does not. We re-run PathDestValid's per-tile
+	// gate below to drop those nodes, mirroring its flag handling at
+	// CvAStar.cpp:963-984 so DECLARE_WAR / IGNORE_STACKING searches accept
+	// the same tiles the search itself accepts as destinations.
+	byte bFilterFlags = CvUnit::MOVEFLAG_DESTINATION | CvUnit::MOVEFLAG_PRETEND_CORRECT_EMBARK_STATE;
+	const int iFinderInfo = kFinder.GetInfo();
+	if(iFinderInfo & MOVE_DECLARE_WAR)
+	{
+		bFilterFlags |= CvUnit::MOVEFLAG_ATTACK | CvUnit::MOVEFLAG_DECLARE_WAR;
+	}
+	if(iFinderInfo & MOVE_IGNORE_STACKING)
+	{
+		bFilterFlags |= CvUnit::MOVEFLAG_IGNORE_STACKING;
+	}
+
+	const CvAStarNode* pBest = NULL;
+	int iBestDist = INT_MAX;
+	int iBestCost = INT_MAX;
+	for(const CvAStarNode* p = kFinder.GetClosedListHead(); p != NULL; p = p->m_pNext)
+	{
+		// Skip the target tile itself. Returning the target as "closest
+		// reachable" is meaningless -- it's exactly where the user is
+		// pointing. (The noise filter below would also catch the common
+		// "destination the unit can't enter" case, but DECLARE_WAR /
+		// IGNORE_STACKING searches relax that gate and could otherwise
+		// pass the target through.)
+		if(p->m_iX == iTargetX && p->m_iY == iTargetY)
+		{
+			continue;
+		}
+		// Drop the trivial-pass noise.
+		if(pUnit != NULL)
+		{
+			CvPlot* pPlot = kMap.plot(p->m_iX, p->m_iY);
+			if(pPlot == NULL || !pUnit->canMoveOrAttackInto(*pPlot, bFilterFlags))
+			{
+				continue;
+			}
+		}
+		const int iDist = plotDistance(p->m_iX, p->m_iY, iTargetX, iTargetY);
+		const int iCost = p->m_iKnownCost;
+		// Primary: minimum hex distance to target. Tiebreaker: minimum
+		// A* g-cost from the unit's start (cheaper to reach). Without the
+		// tiebreaker, tiles at equal hex distance get picked by closed-list
+		// iteration order, which can return e.g. a tile costing 12 MP when
+		// an equally-close tile costing 6 MP exists.
+		if(iDist < iBestDist || (iDist == iBestDist && iCost < iBestCost))
+		{
+			iBestDist = iDist;
+			iBestCost = iCost;
+			pBest = p;
+		}
+	}
+
+	if(pBest != NULL)
+	{
+		lua_pushinteger(L, pBest->m_iX);
+		lua_pushinteger(L, pBest->m_iY);
+		lua_pushinteger(L, iBestDist);
+		return 3;
+	}
+
+	// Closed list empty -- search bailed at PathDestValid before any node
+	// was closed (e.g., destination in foreign territory we can't enter,
+	// destination is a mountain for a non-mountain unit). The unit's
+	// start position is the only meaningful "reached" tile in that case.
+	const int iStartX = kFinder.GetStartX();
+	const int iStartY = kFinder.GetStartY();
+	if(iStartX < 0 || iStartY < 0)
+	{
+		return 0;
+	}
+	const int iDist = plotDistance(iStartX, iStartY, iTargetX, iTargetY);
+	lua_pushinteger(L, iStartX);
+	lua_pushinteger(L, iStartY);
+	lua_pushinteger(L, iDist);
+	return 3;
 }
 //------------------------------------------------------------------------------
 // void selectionListMove(CyPlot* pPlot, bool bAlt, bool bShift, bool bCtrl);

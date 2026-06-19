@@ -15,6 +15,13 @@
 #include "../CvMinorCivAI.h"
 #include "../CvUnitCombat.h"
 
+// CIVVACCESS: scratch buffer holding the most recent Unit:GeneratePath
+// result so Unit:GetPath can read it back, WITHOUT writing the unit's
+// m_kLastPath cache. See lGeneratePath for why touching that cache is
+// unsafe. Single-threaded Lua access: a GeneratePath call fully populates
+// this before the paired GetPath call reads it.
+static CvPathNodeArray s_kCivVAccessPath;
+
 //Utility macro for registering methods
 #define Method(Name)			\
 	lua_pushcclosure(L, l##Name, 0);	\
@@ -41,6 +48,10 @@ void CvLuaUnit::PushMethods(lua_State* L, int t)
 	Method(GetPathEndTurnPlot);
 	Method(GetPathAttackFromPlot);
 	Method(GeneratePath);
+	Method(GetPath);
+	Method(ComputePath);
+	Method(GetMissionQueue);
+	Method(GetBestBuildRoute);
 
 	Method(CanEnterTerritory);
 	Method(GetDeclareWarRangeStrike);
@@ -621,18 +632,213 @@ int CvLuaUnit::lGetPathAttackFromPlot(lua_State* L)
 }
 //------------------------------------------------------------------------------
 //bool generatePath(CyPlot* pToPlot, int iFlags = 0, bool bReuse = false, int* piPathTurns = NULL);
+//
+// CIVVACCESS: Firaxis shipped the body as luaL_error("NYI"). Runs the unit
+// pathfinder from the unit's current plot to pkPlot and stashes the result
+// in s_kCivVAccessPath for Unit:GetPath(). Returns (bool reachable, int
+// pathTurns).
+//
+// Critically, this does NOT call CvUnit::GeneratePath, even though that
+// method computes the same path: it also writes the unit's m_kLastPath and
+// m_uiLastPathCacheDest, the very cache the engine's own mission processing
+// reuses (CvUnit::UpdatePathCache reuses a non-empty cache in
+// UNITFLAG_EVALUATING_MISSION mode rather than recomputing). A navigation /
+// preview / surveyor query on a unit that has a queued move would overwrite
+// that cache, and the engine would then resolve the queued move against our
+// query's path -- stranding the unit busy and, in multiplayer, wedging the
+// simultaneous turn (each client corrupts independently, so they desync).
+// We run the search on the shared pathfinder and copy from its last node,
+// exactly as ComputePath does, leaving the unit's cache untouched. No caller
+// reads the per-node fog flags that CvUnit::GeneratePath annotates after the
+// copy; GetPath recomputes `revealed` itself.
 int CvLuaUnit::lGeneratePath(lua_State* L)
 {
-	luaL_error(L, "NYI");
-	/*CvUnit* pkUnit = GetInstance(L);
+	CvUnit* pkUnit = GetInstance(L);
 	CvPlot* pkPlot = CvLuaPlot::GetInstance(L, 2);
-	const int iFlags = 0;
-	const bool bReuse = luaL_optint(L, 4, 0);	//defeaults to false
-	const bool bResult = pkUnit->generatePath();
+	const int iFlags = luaL_optint(L, 3, 0);
+	// lua_toboolean (not luaL_optint) so callers can pass true/false; the
+	// Firaxis 0/1 convention rejects booleans with "number expected".
+	const bool bReuse = lua_toboolean(L, 4) != 0;
+
+	CvTwoLayerPathFinder& kPathFinder = GC.getPathFinder();
+	const bool bResult = pkPlot && kPathFinder.GenerateUnitPath(
+		pkUnit,
+		pkUnit->getX(), pkUnit->getY(),
+		pkPlot->getX(), pkPlot->getY(),
+		iFlags, bReuse);
+
+	s_kCivVAccessPath.clear();
+	int iPathTurns = 0;
+	if(bResult)
+	{
+		CvAStar::CopyPath(kPathFinder.GetLastNode(), s_kCivVAccessPath);
+		// CopyPath stores destination-first; the destination node's m_iData2
+		// is the leg's total turn count (matches CvUnit::GeneratePath's
+		// piPathTurns assignment), so "turns=1" means it arrives this turn.
+		if(s_kCivVAccessPath.size() > 0)
+		{
+			iPathTurns = s_kCivVAccessPath.front().m_iData2;
+		}
+	}
 
 	lua_pushboolean(L, bResult);
-	return 1;*/
-	return 0;
+	lua_pushinteger(L, iPathTurns);
+	return 2;
+}
+//------------------------------------------------------------------------------
+// CIVVACCESS: Reads the path computed by the most recent Unit:GeneratePath
+// call. Returns a 1-indexed Lua array ordered start-to-destination (the
+// engine stores them destination-first; we flip on push). Each entry is
+// { x, y, moves, turn, flags, revealed } with moves in MOVE_DENOMINATOR
+// 60ths, turn 0-indexed against the GeneratePath call, and revealed a
+// boolean for whether the path's tile is currently revealed to the unit's
+// team (so callers can split a fog-crossing path into the visible prefix
+// and the unexplored tail without re-querying CvPlot:IsRevealed in Lua --
+// the engine's pathfinder already used the same answer to compute costs).
+// Empty array if no path is currently cached.
+int CvLuaUnit::lGetPath(lua_State* L)
+{
+	CvUnit* pkUnit = GetInstance(L);
+	// CIVVACCESS: read the scratch buffer lGeneratePath filled, not the
+	// unit's m_kLastPath (which we deliberately no longer touch).
+	const CvPathNodeArray& kNodes = s_kCivVAccessPath;
+	const int iCount = (int)kNodes.size();
+	const TeamTypes eTeam = pkUnit->getTeam();
+	const bool bDebug = GC.getGame().isDebugMode();
+	CvMap& kMap = GC.getMap();
+
+	lua_createtable(L, iCount, 0);
+	for(int i = 0; i < iCount; ++i)
+	{
+		const CvPathNode& kNode = kNodes[iCount - 1 - i];
+		const CvPlot* pkPlot = kMap.plot(kNode.m_iX, kNode.m_iY);
+		const bool bRevealed = (pkPlot != NULL) && pkPlot->isRevealed(eTeam, bDebug);
+		lua_createtable(L, 0, 6);
+		lua_pushinteger(L, kNode.m_iX);     lua_setfield(L, -2, "x");
+		lua_pushinteger(L, kNode.m_iY);     lua_setfield(L, -2, "y");
+		lua_pushinteger(L, kNode.m_iData1); lua_setfield(L, -2, "moves");
+		lua_pushinteger(L, kNode.m_iData2); lua_setfield(L, -2, "turn");
+		lua_pushinteger(L, kNode.m_iFlags); lua_setfield(L, -2, "flags");
+		lua_pushboolean(L, bRevealed);      lua_setfield(L, -2, "revealed");
+		lua_rawseti(L, -2, i + 1);
+	}
+	return 1;
+}
+//------------------------------------------------------------------------------
+// CIVVACCESS: Run the pathfinder for this unit between two arbitrary
+// plots without disturbing the unit's m_kLastPath cache. GeneratePath /
+// GetPath always start from the unit's current position and update the
+// cache used by mission processing; queued-waypoint computation needs to
+// chain pathfinder runs from each prior leg's destination, which a
+// cache-clobbering call would corrupt.
+//
+// Returns (nodes, ok, legTurns). Nodes is a 1-indexed Lua array ordered
+// start-to-destination (origin at [1], destination at [#nodes]); each
+// entry is { x, y, moves, turn, flags, revealed } matching GetPath's shape.
+// legTurns is INT_MAX-equivalent on failure; caller treats ok==false as
+// "skip this leg." Empty array on failure.
+//
+// Optional 5th arg bFreshTurn (default false): when true the start node is
+// seeded with the unit's full move allowance rather than its current
+// movesLeft, so a leg that begins at a future waypoint is priced as if the
+// unit resumes there on a fresh turn instead of inheriting moves already
+// spent this turn. See MOVE_CIVVACCESS_FRESH_TURN.
+int CvLuaUnit::lComputePath(lua_State* L)
+{
+	CvUnit* pkUnit = GetInstance(L);
+	CvPlot* pkFromPlot = CvLuaPlot::GetInstance(L, 2);
+	CvPlot* pkToPlot = CvLuaPlot::GetInstance(L, 3);
+	const int iFlags = luaL_optint(L, 4, 0);
+	const bool bFreshTurn = lua_toboolean(L, 5) != 0;
+	const int iPathFlags = bFreshTurn ? (iFlags | MOVE_CIVVACCESS_FRESH_TURN) : iFlags;
+
+	CvTwoLayerPathFinder& kPathFinder = GC.getPathFinder();
+	const bool bSuccess = pkFromPlot && pkToPlot && kPathFinder.GenerateUnitPath(
+		pkUnit,
+		pkFromPlot->getX(), pkFromPlot->getY(),
+		pkToPlot->getX(), pkToPlot->getY(),
+		iPathFlags, false);
+
+	CvPathNodeArray kNodes;
+	if(bSuccess)
+	{
+		CvAStar::CopyPath(kPathFinder.GetLastNode(), kNodes);
+	}
+	const int iCount = (int)kNodes.size();
+	const TeamTypes eTeam = pkUnit->getTeam();
+	const bool bDebug = GC.getGame().isDebugMode();
+	CvMap& kMap = GC.getMap();
+
+	lua_createtable(L, iCount, 0);
+	for(int i = 0; i < iCount; ++i)
+	{
+		// CopyPath stores destination-first; flip on push so [1] is the
+		// origin and [#nodes] is the destination, matching GetPath.
+		const CvPathNode& kNode = kNodes[iCount - 1 - i];
+		const CvPlot* pkPlot = kMap.plot(kNode.m_iX, kNode.m_iY);
+		const bool bRevealed = (pkPlot != NULL) && pkPlot->isRevealed(eTeam, bDebug);
+		lua_createtable(L, 0, 6);
+		lua_pushinteger(L, kNode.m_iX);     lua_setfield(L, -2, "x");
+		lua_pushinteger(L, kNode.m_iY);     lua_setfield(L, -2, "y");
+		lua_pushinteger(L, kNode.m_iData1); lua_setfield(L, -2, "moves");
+		lua_pushinteger(L, kNode.m_iData2); lua_setfield(L, -2, "turn");
+		lua_pushinteger(L, kNode.m_iFlags); lua_setfield(L, -2, "flags");
+		lua_pushboolean(L, bRevealed);      lua_setfield(L, -2, "revealed");
+		lua_rawseti(L, -2, i + 1);
+	}
+
+	lua_pushboolean(L, bSuccess);
+	// Front of the destination-first array is the destination node; its
+	// turn value is the leg's total turn count (matches CvUnit::GeneratePath
+	// piPathTurns assignment).
+	const int iLegTurns = (bSuccess && iCount > 0) ? kNodes.front().m_iData2 : 0;
+	lua_pushinteger(L, iLegTurns);
+	return 3;
+}
+//------------------------------------------------------------------------------
+// CIVVACCESS: Returns the unit's pending mission queue as a 1-indexed
+// Lua array. Each entry is { mission, data1, data2, flags, pushTurn }
+// where mission is the MissionTypes enum value. Empty array if the queue
+// is empty.
+int CvLuaUnit::lGetMissionQueue(lua_State* L)
+{
+	CvUnit* pkUnit = GetInstance(L);
+	const int iCount = pkUnit->GetLengthMissionQueue();
+
+	lua_createtable(L, iCount, 0);
+	for(int i = 0; i < iCount; ++i)
+	{
+		const MissionData* pkData = pkUnit->GetMissionData(i);
+		if(pkData == NULL)
+		{
+			continue;
+		}
+		lua_createtable(L, 0, 5);
+		lua_pushinteger(L, pkData->eMissionType); lua_setfield(L, -2, "mission");
+		lua_pushinteger(L, pkData->iData1);       lua_setfield(L, -2, "data1");
+		lua_pushinteger(L, pkData->iData2);       lua_setfield(L, -2, "data2");
+		lua_pushinteger(L, pkData->iFlags);       lua_setfield(L, -2, "flags");
+		lua_pushinteger(L, pkData->iPushTurn);    lua_setfield(L, -2, "pushTurn");
+		lua_rawseti(L, -2, i + 1);
+	}
+	return 1;
+}
+//------------------------------------------------------------------------------
+// CIVVACCESS: Wraps CvUnit::GetBestBuildRoute (CvUnit.cpp:18793). Returns
+// (routeId, buildId) for the best route the unit's owner has tech for that
+// can be built on the given plot. NO_ROUTE / NO_BUILD when the unit can't
+// build any route there. Replaces a Lua-side reimplementation that walked
+// GameInfo.Builds and re-applied tech / Routes.Value comparisons; the
+// engine's picker is one call.
+int CvLuaUnit::lGetBestBuildRoute(lua_State* L)
+{
+	CvUnit* pkUnit = GetInstance(L);
+	CvPlot* pkPlot = CvLuaPlot::GetInstance(L, 2);
+	BuildTypes eBestBuild = NO_BUILD;
+	const RouteTypes eBestRoute = pkUnit->GetBestBuildRoute(pkPlot, &eBestBuild);
+	lua_pushinteger(L, eBestRoute);
+	lua_pushinteger(L, eBestBuild);
+	return 2;
 }
 //------------------------------------------------------------------------------
 //bool canEnterTerritory(int /*TeamTypes*/ eTeam, bool bIgnoreRightOfPassage = false, bool bIsCity = false);
@@ -664,13 +870,21 @@ int CvLuaUnit::lGetDeclareWarRangeStrike(lua_State* L)
 	return 1;
 }
 //------------------------------------------------------------------------------
-//bool canMoveOrAttackInto(CyPlot* pPlot, bool bDeclareWar = false, bDestination = false);
+//bool canMoveOrAttackInto(CyPlot* pPlot, bool bDeclareWar = false, bDestination = false, bPretendCorrectEmbarkState = false);
 int CvLuaUnit::lCanMoveOrAttackInto(lua_State* L)
 {
 	CvUnit* pkUnit = GetInstance(L);
 	CvPlot* pkPlot = CvLuaPlot::GetInstance(L, 2);
 	const bool bDeclareWar = luaL_optint(L, 3, 0);
 	const bool bDestination = luaL_optint(L, 4, 0);
+	// CIVVACCESS: bPretendCorrectEmbarkState lets callers gate cross-domain
+	// steps (embark / disembark) the same way the engine pathfinder does.
+	// Without it, an embarked unit hitting a land destination always returns
+	// false because canEnterTerrain tests against the unit's *current* embark
+	// state; PathValid (CvAStar.cpp) sets this flag on every node, which is
+	// why GeneratePath accepts the route while a bare canMoveOrAttackInto
+	// rejects it. Defaults off so existing callers see no behavior change.
+	const bool bPretendCorrectEmbarkState = luaL_optint(L, 5, 0);
 
 	byte bMoveFlags = 0;
 	if(bDeclareWar)
@@ -681,11 +895,18 @@ int CvLuaUnit::lCanMoveOrAttackInto(lua_State* L)
 	{
 		bMoveFlags |= CvUnit::MOVEFLAG_DESTINATION;
 	}
+	if(bPretendCorrectEmbarkState)
+	{
+		bMoveFlags |= CvUnit::MOVEFLAG_PRETEND_CORRECT_EMBARK_STATE;
+	}
 
 	bool bResult = false;
 	if(pkPlot)
 	{
-		pkUnit->canMoveOrAttackInto(*pkPlot, bMoveFlags);
+		// CIVVACCESS: vanilla SDK discards the return value here, so the
+		// stock binding always returns false. Assigning the result lets
+		// Lua callers actually use this gate.
+		bResult = pkUnit->canMoveOrAttackInto(*pkPlot, bMoveFlags);
 	}
 
 	lua_pushboolean(L, bResult);

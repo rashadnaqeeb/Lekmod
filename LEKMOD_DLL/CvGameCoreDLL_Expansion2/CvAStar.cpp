@@ -1116,6 +1116,15 @@ int PathDest(int iToX, int iToY, const void* pointer, const CvAStar* finder)
 int PathDest(int iToX, int iToY, const void* pointer, CvAStar* finder)
 #endif
 {
+	// CIVVACCESS: Force-valid mode runs the search purely to populate
+	// m_pClosed with the unit's reachable region; we never want it to
+	// "succeed" by reaching the destination. Returning false here keeps
+	// Step() looping until the open list exhausts. Pairs with the
+	// matching short-circuit in PathDestValid.
+	if(finder->GetInfo() & MOVE_CIVVACCESS_FORCE_DEST_VALID)
+	{
+		return false;
+	}
 	if(iToX == finder->GetDestX() && iToY == finder->GetDestY())
 	{
 #ifdef AUI_WARNING_FIXES
@@ -1163,6 +1172,17 @@ int PathDestValid(int iToX, int iToY, const void* pointer, CvAStar* finder)
 
 	if(pToPlot == NULL || pUnit == NULL)
 		return FALSE;
+
+	// CIVVACCESS: Force-valid mode for the diagnostic exploration. Skips
+	// every gate below and lets the search run; intermediate PathValid
+	// still rejects steps the unit can't take, so the search exhausts
+	// naturally on unreachable destinations and m_pClosed populates with
+	// the reachable region. See CvAStar.h's MOVE_CIVVACCESS_FORCE_DEST_VALID
+	// for full rationale.
+	if(finder->GetInfo() & MOVE_CIVVACCESS_FORCE_DEST_VALID)
+	{
+		return TRUE;
+	}
 
 	if(pUnit->plot() == pToPlot)
 	{
@@ -1239,7 +1259,13 @@ int PathDestValid(int iToX, int iToY, const void* pointer, CvAStar* finder)
 		CvCity* pCity = pToPlot->getPlotCity();
 		if(pCity)
 		{
-			if(pCacheData->getOwner() != pCity->getOwner() && !GET_TEAM(eTeam).isAtWar(pCity->getTeam()) && !(finder->GetInfo() & MOVE_IGNORE_STACKING))
+			// CIVVACCESS: also let MOVE_DECLARE_WAR bypass this gate. Vanilla
+			// rejects foreign-cities-at-peace as destinations regardless of
+			// whether the player is willing to declare war to reach them,
+			// which short-circuits PathDestValid before the bMoveFlags check
+			// below even runs. With MOVE_DECLARE_WAR set, the player is
+			// committing to war and the city is a legitimate target post-DOW.
+			if(pCacheData->getOwner() != pCity->getOwner() && !GET_TEAM(eTeam).isAtWar(pCity->getTeam()) && !(finder->GetInfo() & MOVE_IGNORE_STACKING) && !(finder->GetInfo() & MOVE_DECLARE_WAR))
 			{
 				return FALSE;
 			}
@@ -1258,6 +1284,17 @@ int PathDestValid(int iToX, int iToY, const void* pointer, CvAStar* finder)
 		if((pUnit->IsDeclareWar() || (finder->GetInfo() & MOVE_DECLARE_WAR)))
 		{
 			bMoveFlags |= CvUnit::MOVEFLAG_ATTACK;
+			// CIVVACCESS: Also propagate MOVEFLAG_DECLARE_WAR so canMoveInto's
+			// territory-bypass branch (CvUnit.cpp:2737) accepts foreign closed-
+			// borders destinations the player is willing to declare war to
+			// reach. Vanilla only sets MOVEFLAG_ATTACK here, which doesn't
+			// satisfy the canEnterTerritory failure recovery path -- so a
+			// destination in peaceful-rival territory failed PathDestValid
+			// outright with MOVE_DECLARE_WAR set, defeating the purpose of
+			// the flag. Pairs with the matching translation in PathValid
+			// below (line ~1455) so the same flag works at every node the
+			// search probes.
+			bMoveFlags |= CvUnit::MOVEFLAG_DECLARE_WAR;
 		}
 
 		if(finder->GetInfo() & MOVE_IGNORE_STACKING)
@@ -2048,7 +2085,15 @@ int PathValid(CvAStarNode* parent, CvAStarNode* node, int data, const void* poin
 					if(kNodeCacheData.bIsRevealedToTeam)
 					{
 #endif
-						if (kNodeCacheData.bContainsOtherFriendlyTeamCity && !(iFinderIgnoreStacking))
+						// CIVVACCESS: Also let MOVE_DECLARE_WAR bypass the
+						// foreign-friendly-city rejection. This per-node check
+						// fires for any foreign city we're not at war with,
+						// blocking the search from validating the city as a
+						// node and short-circuiting any path TO the city even
+						// after PathDestValid accepts it. Mirrors the bypass
+						// in PathDestValid (line ~933) so the DECLARE_WAR
+						// retry can reach foreign-city destinations.
+						if (kNodeCacheData.bContainsOtherFriendlyTeamCity && !(iFinderIgnoreStacking) && !(iFinderInfo & MOVE_DECLARE_WAR))
 							return FALSE;
 					}
 				}
@@ -2227,12 +2272,26 @@ int PathValid(CvAStarNode* parent, CvAStarNode* node, int data, const void* poin
 	if(bAIControl || kFromNodeCacheData.bIsRevealedToTeam || pCacheData->isEmbarked() || !bIsHuman)
 #endif
 	{
+		// CIVVACCESS: Translate the pathfinder-side MOVE_DECLARE_WAR bit into
+		// the unit-side MOVEFLAG_DECLARE_WAR so canMoveThrough/canMoveOrAttackInto
+		// permit intermediate plots in peaceful-rival territory we lack open
+		// borders with. Without this, vanilla PathValid only relaxes the
+		// destination plot (via PathDestValid line 939-942), so any path
+		// requiring more than one step through foreign closed-borders
+		// territory falsely fails. Used by the mod's discriminative
+		// pathfinder diagnostic to detect the "blocked by closed borders"
+		// case for multi-step routes.
+		byte bMoveFlags = CvUnit::MOVEFLAG_PRETEND_CORRECT_EMBARK_STATE;
+		if(iFinderInfo & MOVE_DECLARE_WAR)
+		{
+			bMoveFlags |= CvUnit::MOVEFLAG_DECLARE_WAR;
+		}
 		if(iFinderInfo & MOVE_UNITS_THROUGH_ENEMY)
 		{
 #ifdef AUI_ASTAR_FIX_CAN_ENTER_TERRAIN_NO_DUPLICATE_CALLS
-			if (!(pUnit->canMoveOrAttackInto(*pFromPlot, CvUnit::MOVEFLAG_PRETEND_CORRECT_EMBARK_STATE, kFromNodeCacheData.bCanEnterTerrain, true)))
+			if (!(pUnit->canMoveOrAttackInto(*pFromPlot, bMoveFlags, kFromNodeCacheData.bCanEnterTerrain, true)))
 #else
-			if(!(pUnit->canMoveOrAttackInto(*pFromPlot, CvUnit::MOVEFLAG_PRETEND_CORRECT_EMBARK_STATE)))
+			if(!(pUnit->canMoveOrAttackInto(*pFromPlot, bMoveFlags)))
 #endif
 			{
 				return FALSE;
@@ -2241,9 +2300,9 @@ int PathValid(CvAStarNode* parent, CvAStarNode* node, int data, const void* poin
 		else
 		{
 #ifdef AUI_ASTAR_FIX_CAN_ENTER_TERRAIN_NO_DUPLICATE_CALLS
-			if (!(pUnit->canMoveThrough(*pFromPlot, CvUnit::MOVEFLAG_PRETEND_CORRECT_EMBARK_STATE, kFromNodeCacheData.bCanEnterTerrain, true)))
+			if (!(pUnit->canMoveThrough(*pFromPlot, bMoveFlags, kFromNodeCacheData.bCanEnterTerrain, true)))
 #else
-			if(!(pUnit->canMoveThrough(*pFromPlot, CvUnit::MOVEFLAG_PRETEND_CORRECT_EMBARK_STATE)))
+			if(!(pUnit->canMoveThrough(*pFromPlot, bMoveFlags)))
 #endif
 			{
 				return FALSE;
@@ -2269,11 +2328,23 @@ int PathAdd(CvAStarNode* parent, CvAStarNode* node, int data, const void* pointe
 	if(data == ASNC_INITIALADD)
 	{
 		iTurns = 1;
+		// CIVVACCESS: MOVE_CIVVACCESS_FRESH_TURN prices the leg as if begun
+		// on a fresh turn (full move allowance) rather than inheriting moves
+		// the unit has already spent this turn. ComputePath sets it when
+		// previewing a leg that starts at a future waypoint, where the unit
+		// will have reset to full moves by the time it arrives.
+		if(finder->GetInfo() & MOVE_CIVVACCESS_FRESH_TURN)
+		{
+			iMoves = std::min(iMoves, pCacheData->maxMoves());
+		}
+		else
+		{
 #ifdef AUI_ASTAR_MINOR_OPTIMIZATION
-		iMoves = pUnit->movesLeft();
+			iMoves = pUnit->movesLeft();
 #else
-		iMoves = std::min(iMoves, pUnit->movesLeft());
+			iMoves = std::min(iMoves, pUnit->movesLeft());
 #endif
+		}
 	}
 	else
 	{

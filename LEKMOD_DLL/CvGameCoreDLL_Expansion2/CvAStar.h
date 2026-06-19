@@ -1,5 +1,5 @@
 /*	-------------------------------------------------------------------------------------------------------
-	© 1991-2012 Take-Two Interactive Software and its subsidiaries.  Developed by Firaxis Games.  
+	ï¿½ 1991-2012 Take-Two Interactive Software and its subsidiaries.  Developed by Firaxis Games.  
 	Sid Meier's Civilization V, Civ, Civilization, 2K Games, Firaxis Games, Take-Two Interactive Software 
 	and their respective logos are all trademarks of Take-Two interactive Software, Inc.  
 	All other marks and trademarks are the property of their respective owners.  
@@ -57,6 +57,23 @@ typedef void(*CvAEnd)(const void*, CvAStar*);
 #define MOVE_ANY_ROUTE					    (0x80000000) // because we're passing in the player number as well as the route flag
 #define MOVE_ROUTE_ALLOW_UNEXPLORED			(0x40000000) // When searching for a route, allow the search to use unrevealed plots
 //#define MOVE_NON_WAR_ROUTE				 // we're passing the player id and other flags in as well. This flag checks to see if it can get from point to point without going into territory with a team we're at war with
+// CIVVACCESS: Diagnostic exploration mode. When set, PathDestValid returns
+// TRUE unconditionally so the search runs even when the destination is one
+// the unit can't actually enter (water target for non-embarking land unit,
+// deep ocean without Astronomy, water tile occupied by an at-war unit a
+// land unit can't melee, etc.). Search exhausts naturally as PathValid
+// rejects intermediate steps the unit can't take, populating m_pClosed
+// with the unit's reachable region. Reserved for the path-failure
+// diagnostic; do not use for real mission flags.
+#define MOVE_CIVVACCESS_FORCE_DEST_VALID	(0x20000000)
+// CIVVACCESS: Fresh-turn move accounting. When set, PathAdd seeds the
+// start node with the unit's full move allowance (maxMoves) instead of its
+// current movesLeft. ComputePath sets it when previewing a leg that begins
+// at a future waypoint rather than the unit's current plot: by the time the
+// unit reaches that waypoint it has reset to full moves, so pricing the leg
+// against moves already spent this turn would overstate its turn count.
+// Reserved for ComputePath previews; do not use for real mission flags.
+#define MOVE_CIVVACCESS_FRESH_TURN			(0x10000000)
 
 //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 //
@@ -105,6 +122,18 @@ public:
 		return (m_pBest ? m_pBest->m_pParent : NULL);
 }
 #endif
+
+	// CIVVACCESS: Read accessor for the closed list head. After a failed
+	// GeneratePath, m_pBest is NULL but m_pClosed still chains every node
+	// the search explored. Walking it gives us the search frontier; the
+	// closed-list node closest to the original destination is the "got
+	// as far as X" answer for unreachable destinations. The list survives
+	// until the next GeneratePath call wipes it (when bReuse=false), so
+	// callers must read this before any subsequent search runs.
+	inline CvAStarNode* GetClosedListHead() const
+	{
+		return m_pClosed;
+	}
 
 #ifdef AUI_CONSTIFY
 	inline bool IsPathStart(int iX, int iY) const
@@ -206,6 +235,17 @@ public:
 #ifdef AUI_ASTAR_TURN_LIMITER
 		m_iMaxTurns = iMaxTurns;
 #endif
+	}
+
+	// CIVVACCESS: Read accessor for the data pointer (set via SetData).
+	// CvTwoLayerPathFinder::GenerateUnitPath sets this to the unit pointer
+	// before running the search; lGetClosestSearchedPlot reads it back to
+	// re-validate closed-list candidates through CvUnit::canMoveOrAttackInto,
+	// dropping nodes admitted by PathValid's first-step trivial pass
+	// (CvAStar.cpp:1445) that the unit can't actually stand on.
+	inline const void* GetData() const
+	{
+		return m_pData;
 	}
 
 	inline bool IsMPCacheSafe() const

@@ -261,6 +261,7 @@ void CvLuaPlot::PushMethods(lua_State* L, int t)
 	Method(IsImprovementPillaged);
 
 	Method(CanSeePlot);
+	Method(HasLineOfSight);
 
 	Method(GetContinentArtType);
 	Method(SetContinentArtType);
@@ -607,7 +608,11 @@ int CvLuaPlot::lGetFeatureFood(lua_State* L)
 }
 #endif
 //------------------------------------------------------------------------------
-//CyUnit* getBestDefender(PlayerTypes eOwner, PlayerTypes eAttackingPlayer, CyUnit* pAttacker, bool bTestAtWar, bool bTestPotentialEnemy, bool bTestCanMove);
+//CyUnit* getBestDefender(PlayerTypes eOwner, PlayerTypes eAttackingPlayer, CyUnit* pAttacker, bool bTestAtWar, bool bTestPotentialEnemy, bool bTestCanMove, bool bNoncombatAllowed);
+// CIVVACCESS: Vanilla binding stops at bTestCanMove and leaves bNoncombatAllowed
+// at its C++ default of false, so Lua callers can never get civilian defenders
+// back. Range-strike preview (where the engine accepts civilian targets) needs
+// to read this flag, so we extend the arity by one optional arg.
 int CvLuaPlot::lGetBestDefender(lua_State* L)
 {
 	CvPlot* pkPlot = GetInstance(L);
@@ -617,7 +622,8 @@ int CvLuaPlot::lGetBestDefender(lua_State* L)
 	const bool bTestAtWar = luaL_optint(L, 5, 0);
 	const bool bTestPotentialEnemy = luaL_optint(L, 6, 0);
 	const bool bTestCanMove = luaL_optint(L, 7, 0);
-	UnitHandle pkUnit = pkPlot->getBestDefender(eOwner, eAttackingPlayer, pkAttacker, bTestAtWar, bTestPotentialEnemy, bTestCanMove);
+	const bool bNoncombatAllowed = luaL_optint(L, 8, 0);
+	UnitHandle pkUnit = pkPlot->getBestDefender(eOwner, eAttackingPlayer, pkAttacker, bTestAtWar, bTestPotentialEnemy, bTestCanMove, bNoncombatAllowed);
 	CvLuaUnit::Push(L, pkUnit.pointer());
 	return 1;
 }
@@ -1739,6 +1745,33 @@ int CvLuaPlot::lCanSeePlot(lua_State* L)
 	lua_pushboolean(L, bCanSee);
 	return 1;
 
+}
+//------------------------------------------------------------------------------
+//bool HasLineOfSight(CvPlot *pPlot, TeamTypes eTeam)
+// CIVVACCESS: pure-LoS query. canSeePlot couples the visibility test
+// (CvTargeting::CanSeeDisplacementPlot) with a range gate (iDistance <= iRange)
+// and a facing gate (shouldProcessDisplacementPlot). Range-strike preview wants
+// LoS in isolation -- the range and target legality are checked separately --
+// so we pass a generous iRange to defeat the distance gate and NO_DIRECTION to
+// short-circuit shouldProcessDisplacementPlot to true. Same trick the Lua side
+// previously did with LOS_PROBE_RANGE = 100; consolidating here lets callers
+// drop the magic number and ask the visibility question they actually want.
+int CvLuaPlot::lHasLineOfSight(lua_State* L)
+{
+	CvPlot* pkThisPlot = GetInstance(L);
+	CvPlot* pkThatPlot = GetInstance(L, 2);
+	TeamTypes eTeam = (TeamTypes) lua_tointeger(L, 3);
+
+	bool bCanSee = false;
+	if(pkThisPlot)
+	{
+		// 10000 hexes is well above any map's max plot distance; safe headroom
+		// for canSeePlot's internal iRange++ without integer overflow.
+		bCanSee = pkThisPlot->canSeePlot(pkThatPlot, eTeam, 10000, NO_DIRECTION);
+	}
+
+	lua_pushboolean(L, bCanSee);
+	return 1;
 }
 
 //------------------------------------------------------------------------------

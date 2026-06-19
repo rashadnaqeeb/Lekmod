@@ -1,5 +1,5 @@
 /*	-------------------------------------------------------------------------------------------------------
-	© 1991-2012 Take-Two Interactive Software and its subsidiaries.  Developed by Firaxis Games.  
+	ï¿½ 1991-2012 Take-Two Interactive Software and its subsidiaries.  Developed by Firaxis Games.  
 	Sid Meier's Civilization V, Civ, Civilization, 2K Games, Firaxis Games, Take-Two Interactive Software 
 	and their respective logos are all trademarks of Take-Two interactive Software, Inc.  
 	All other marks and trademarks are the property of their respective owners.  
@@ -79,6 +79,12 @@ void CvLuaLeague::PushMethods(lua_State* L, int t)
 	Method(GetResolutionName);
 	Method(GetResolutionDetails);
 	Method(GetMemberDetails);
+	// CIVVACCESS: stock binding only exposes the concatenated GetMemberDetails;
+	// register the three sub-strings so the overview can render them as
+	// independent rows.
+	Method(GetMemberDelegationDetails);
+	Method(GetMemberKnowledgeDetails);
+	Method(GetMemberVoteOpinionDetails);
 	Method(GetProjectDetails);
 	Method(GetProjectRewardTierDetails);
 	Method(GetCurrentEffectsSummary);
@@ -708,6 +714,48 @@ int CvLuaLeague::lGetMemberDetails(lua_State* L)
 	const PlayerTypes eObserver = (PlayerTypes) lua_tointeger(L, 3);
 
 	CvString sValue = pLeague->GetMemberDetails(eMember, eObserver);
+	lua_pushstring(L, sValue.c_str());
+	return 1;
+}
+//------------------------------------------------------------------------------
+// CIVVACCESS: delegate count + per-source breakdown half of GetMemberDetails.
+//string GetMemberDelegationDetails(PlayerTypes eMember, PlayerTypes eObserver);
+int CvLuaLeague::lGetMemberDelegationDetails(lua_State* L)
+{
+	CvLeague* pLeague = GetInstance(L);
+	const PlayerTypes eMember = (PlayerTypes) lua_tointeger(L, 2);
+	const PlayerTypes eObserver = (PlayerTypes) lua_tointeger(L, 3);
+
+	CvString sValue = pLeague->GetMemberDelegationDetails(eMember, eObserver);
+	lua_pushstring(L, sValue.c_str());
+	return 1;
+}
+//------------------------------------------------------------------------------
+// CIVVACCESS: relationship-knowledge half of GetMemberDetails (ideology /
+// diplomat / understanding-of-goals clauses). Returns "" when eMember == eObserver.
+//string GetMemberKnowledgeDetails(PlayerTypes eMember, PlayerTypes eObserver);
+int CvLuaLeague::lGetMemberKnowledgeDetails(lua_State* L)
+{
+	CvLeague* pLeague = GetInstance(L);
+	const PlayerTypes eMember = (PlayerTypes) lua_tointeger(L, 2);
+	const PlayerTypes eObserver = (PlayerTypes) lua_tointeger(L, 3);
+
+	CvString sValue = pLeague->GetMemberKnowledgeDetails(eMember, eObserver);
+	lua_pushstring(L, sValue.c_str());
+	return 1;
+}
+//------------------------------------------------------------------------------
+// CIVVACCESS: vote-opinions / commitments half of GetMemberDetails. Returns ""
+// when no proposals are on the table or when eMember == eObserver and the
+// member has no commitments.
+//string GetMemberVoteOpinionDetails(PlayerTypes eMember, PlayerTypes eObserver);
+int CvLuaLeague::lGetMemberVoteOpinionDetails(lua_State* L)
+{
+	CvLeague* pLeague = GetInstance(L);
+	const PlayerTypes eMember = (PlayerTypes) lua_tointeger(L, 2);
+	const PlayerTypes eObserver = (PlayerTypes) lua_tointeger(L, 3);
+
+	CvString sValue = pLeague->GetMemberVoteOpinionDetails(eMember, eObserver);
 	lua_pushstring(L, sValue.c_str());
 	return 1;
 }
