@@ -2650,6 +2650,28 @@ void CvMinorCivAI::DoFirstContactWithMajor(TeamTypes eTeam, bool bSuppressMessag
 						CancelActivePlayerEndTurn();
 					}
 
+					// CIVVACCESS: Fire a city-state-greeting hook so the accessibility
+					// mod can announce the first-contact gift in MP, where the popup
+					// above is suppressed (the !isNetworkMultiPlayer guard). Fires
+					// unconditionally for the active player; the MP-only consumer in
+					// CivVAccess_MultiplayerRewards.lua gates on
+					// Game:IsNetworkMultiPlayer() so single-player still rides the
+					// BUTTONPOPUP_CITY_STATE_GREETING path. The empty suffix marks the
+					// gold/faith gift shape (iData2 gold, iData3 faith) shared with
+					// the vanilla fork.
+					ICvEngineScriptSystem1* pkScriptSystem = gDLL->GetScriptSystem();
+					if(pkScriptSystem)
+					{
+						CvLuaArgsHandle args;
+						args->Push(GetPlayer()->GetID());
+						args->Push(iGoldGift);
+						args->Push(iFaithGift);
+						args->Push(bFirstMajorCiv ? 1 : 0);
+						args->Push("", 0);
+						bool bResult = false;
+						LuaSupport::CallHook(pkScriptSystem, "CivVAccessCityStateGreeting", args.get(), bResult);
+					}
+
 					// update the mouseover text for the city-state's city banners
 					int iLoop = 0;
 					CvCity* pLoopCity = NULL;
