@@ -3580,6 +3580,15 @@ int CvLuaGame::lGetTurnTimeElapsed(lua_State* L)
 }
 #endif
 #if defined(LEKMOD_COMBAT_PREDICTOR_IMPROVEMENTS)
+// CIVVACCESS: two optional trailing args carry damage that is already resolved
+// when the previewed combat starts -- defensive fire support that hit the
+// attacker, the attacker's own opening volley that hit the defender. The
+// predictor honours CvCombatInfo::getExtraDamageTaken internally (it feeds
+// getWoundedRatio, so a wounded unit deals less), but the stock binding never
+// sets it and exposes no way to. Without them a preview of a compound attack
+// speaks a counterattack from a defender the volley has not yet wounded.
+// Omitted by every other caller, which leaves both at 0 and behaviour
+// unchanged.
 int CvLuaGame::lGetCombatDamage(lua_State* L)
 {
 	CvUnit* pAttacker = CvLuaUnit::GetInstance(L, 1, false);
@@ -3591,6 +3600,8 @@ int CvLuaGame::lGetCombatDamage(lua_State* L)
 	const bool bRangedAttack = lua_toboolean(L, 7);
 	const bool bBombingMission = lua_toboolean(L, 8);
 	const bool bAirSweep = lua_toboolean(L, 9);
+	const int iAttackerExtraDamage = luaL_optint(L, 10, 0);
+	const int iDefenderExtraDamage = luaL_optint(L, 11, 0);
 
 	CvCombatInfo kInfo;
 	kInfo.setUnit(BATTLE_UNIT_ATTACKER, pAttacker);
@@ -3603,6 +3614,9 @@ int CvLuaGame::lGetCombatDamage(lua_State* L)
 	kInfo.setAttackIsRanged(bRangedAttack);
 	kInfo.setAttackIsBombingMission(bBombingMission);
 	kInfo.setAttackIsAirSweep(bAirSweep);
+	// CIVVACCESS: see this function's header comment.
+	kInfo.setExtraDamageTaken(BATTLE_UNIT_ATTACKER, iAttackerExtraDamage);
+	kInfo.setExtraDamageTaken(BATTLE_UNIT_DEFENDER, iDefenderExtraDamage);
 
 	const bool bOrdinaryRangedAttack = bRangedAttack && !bBombingMission && !bAirSweep;
 	kInfo.setDefenderRetaliates(!bOrdinaryRangedAttack);
